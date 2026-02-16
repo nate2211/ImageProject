@@ -1,6 +1,3 @@
-Here is a comprehensive README.md file tailored for your project. It covers installation, the FFmpeg integration we discussed, usage of the GUI/CLI, and the build process.
-
-You can copy and paste this directly into your GitHub repository.
 ImageGen GUI & Pipeline
 
 A modular, procedural image processing pipeline capable of generating novel visual styles, enhancing photos, and processing real-time video/screen streams. Built with Python, PyQt5, and FFmpeg.
