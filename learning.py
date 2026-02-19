@@ -2,7 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Tuple
+from typing import Optional, Tuple, List, Dict, Any
 
 import numpy as np
 from PIL import Image
@@ -83,13 +83,40 @@ class LearnProfileGenerator(BaseGenerator):
     """
     Learn global, non-derivative cues from the input and save them to disk.
     Returns the input image unchanged (so it can be piped).
-    Extras:
-      • out (str): path to save the profile (.npz). Required.
-      • colors (int): K for k-means palette (default 9).
-      • photo_bins (int): luminance bins for the ramp (default 64).
-      • sample_px (int): max pixels sampled for k-means (default 60000).
-      • density_down (int): internal downscale for density map (default 256).
     """
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            {
+                "name": "out",
+                "type": str,
+                "default": "profile.npz",
+                "help": "Path to save the learned profile (.npz)."
+            },
+            {
+                "name": "colors",
+                "type": int,
+                "default": 9,
+                "min": 3, "max": 32,
+                "help": "Number of dominant colors to extract (k-means)."
+            },
+            {
+                "name": "photo_bins",
+                "type": int,
+                "default": 64,
+                "min": 16, "max": 256,
+                "help": "Resolution of the luminance ramp."
+            },
+            {
+                "name": "sample_px",
+                "type": int,
+                "default": 60000,
+                "min": 1000, "max": 500000,
+                "help": "Number of pixels to sample for color analysis."
+            }
+        ]
+
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         out_path = (kwargs.get("out") or kwargs.get("learn_profile.out") or "").strip()
         if not out_path:
@@ -155,29 +182,105 @@ class ProfileContextGenerator(BaseGenerator):
     Context-only renderer that *loads* a learned profile and applies it to the
     current input. Geometry is procedural; only global cues from the profile
     are used (color ramp, orientation, horizon, composition density).
-
-    Extras:
-      • profile (str): path to a .npz learned via learn_profile. Required.
-      • motif (str): 'cells'|'waves'|'stripes'|'clouds' (default 'cells')
-      • sites (int): only for 'cells' (default 1200)
-      • relax (int): Lloyd steps for 'cells' (default 2)
-      • seed_jitter (float): 0..1 jitter for site layout (default 0.18)
-      • aa (float): 1..2 SSAA (default 1.35)
-      • q_levels, contrast, substance, edge_glow, vignette,
-        smooth, smoothness, clarity, saturation:
-        stylistic knobs mirroring palette_context
-      • photo_density (float): blend for using profile density in layout (default 0.55)
-      • photo_orient (float): strength of orientation alignment (default 0.65)
-
-      • compose (str): 'overlay' (default) | 'replace'
-      • overlay_alpha (float): 0..1 global overlay strength (default 0.35)
-      • edge_protect (float): 0..1 reduce overlay in detailed regions (default 0.70)
-      • preserve_details (bool): if true, blend color only (keep photo luminance) (default true)
-      • preserve_blacks (float): extra shadow protection 0..1 (default 0.40)
-      • protect_highlights (float): extra highlight protection 0..1 (default 0.20)
-      • chroma_match (bool): normalize context saturation to the photo (default true)
-      • chroma_clip (float): clamp for saturation scale (default 0.85..1.25 window)
     """
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            # Inputs
+            {
+                "name": "profile",
+                "type": str,
+                "default": "profile.npz",
+                "help": "Path to the learned profile (.npz)."
+            },
+            # Pattern
+            {
+                "name": "motif",
+                "type": str,
+                "default": "cells",
+                "choices": ["cells", "waves", "stripes", "clouds"],
+                "help": "Visual pattern style."
+            },
+            {
+                "name": "sites",
+                "type": int,
+                "default": 1200,
+                "min": 100, "max": 5000,
+                "help": "Number of Voronoi sites (for 'cells' motif)."
+            },
+            {
+                "name": "relax",
+                "type": int,
+                "default": 2,
+                "min": 0, "max": 10,
+                "help": "Lloyd relaxation steps for cell uniformity."
+            },
+            # Style
+            {
+                "name": "smoothness",
+                "type": float,
+                "default": 0.20,
+                "min": 0.0, "max": 1.0,
+                "help": "Overall pattern smoothing."
+            },
+            {
+                "name": "substance",
+                "type": float,
+                "default": 0.55,
+                "min": 0.0, "max": 1.0,
+                "help": "Cell core/edge contrast strength."
+            },
+            {
+                "name": "edge_glow",
+                "type": float,
+                "default": 0.12,
+                "min": 0.0, "max": 1.0,
+                "help": "Glowing edges between cells."
+            },
+            {
+                "name": "photo_density",
+                "type": float,
+                "default": 0.55,
+                "min": 0.0, "max": 1.0,
+                "help": "How much the photo structure guides cell distribution."
+            },
+            # Composition
+            {
+                "name": "compose",
+                "type": str,
+                "default": "overlay",
+                "choices": ["overlay", "replace"],
+                "help": "Mix mode: 'overlay' blends with photo, 'replace' shows pattern only."
+            },
+            {
+                "name": "overlay_alpha",
+                "type": float,
+                "default": 0.35,
+                "min": 0.0, "max": 1.0,
+                "help": "Opacity of the pattern overlay."
+            },
+            {
+                "name": "edge_protect",
+                "type": float,
+                "default": 0.70,
+                "min": 0.0, "max": 1.0,
+                "help": "Reduces overlay on sharp edges to preserve detail."
+            },
+            {
+                "name": "preserve_details",
+                "type": bool,
+                "default": True,
+                "help": "If True, keeps photo luminance (Luma) and only blends Color."
+            },
+            {
+                "name": "chroma_match",
+                "type": bool,
+                "default": True,
+                "help": "Match pattern saturation to the original photo."
+            }
+        ]
+
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         rng = _rng(self.seed)
 

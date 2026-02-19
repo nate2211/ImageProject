@@ -13,9 +13,9 @@ from PyQt5.QtWidgets import (
     QListWidget, QPushButton, QLabel, QFileDialog, QSplitter,
     QScrollArea, QComboBox, QGroupBox, QCheckBox, QToolBar, QMessageBox,
     QAbstractItemView, QAction, QListWidgetItem, QLineEdit, QSlider,
-    QDoubleSpinBox, QSpinBox, QFormLayout, QFrame, QStyleFactory, QSizePolicy
+    QDoubleSpinBox, QSpinBox, QFormLayout, QFrame, QStyleFactory, QSizePolicy,
+    QColorDialog,   # <-- ADD THIS
 )
-
 from PIL import Image
 import numpy as np
 
@@ -329,7 +329,85 @@ class IntParam(QWidget):
     def value(self):
         return self.spin.value()
 
+class ColorParam(QWidget):
+    """
+    Color picker param: stores value as "R,G,B" in a QLineEdit.
+    Button opens QColorDialog (color wheel / full picker).
+    """
+    def __init__(self, name: str, val: str, parent=None):
+        super().__init__(parent)
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 5, 0, 5)
+        self.layout.setSpacing(2)
 
+        lbl_row = QHBoxLayout()
+        self.lbl = QLabel(name)
+        lbl_row.addWidget(self.lbl)
+        self.layout.addLayout(lbl_row)
+
+        row = QHBoxLayout()
+        self.line = QLineEdit(str(val or "255,255,255"))
+        self.btn = QPushButton("")
+        self.btn.setFixedWidth(30)
+        self.btn.setFixedHeight(22)
+
+        row.addWidget(self.line, 1)
+        row.addWidget(self.btn)
+        self.layout.addLayout(row)
+
+        self.btn.clicked.connect(self._pick_color)
+        self.line.textChanged.connect(self._sync_button)
+
+        self._sync_button()
+
+    def _parse_to_qcolor(self) -> QColor:
+        s = (self.line.text() or "").strip()
+
+        # Allow "#RRGGBB"
+        if s.startswith("#") and len(s) in (7, 9):
+            c = QColor(s)
+            return c if c.isValid() else QColor(255, 255, 255)
+
+        # Allow "R,G,B"
+        try:
+            parts = [p.strip() for p in s.split(",")]
+            if len(parts) >= 3:
+                r = int(float(parts[0]))
+                g = int(float(parts[1]))
+                b = int(float(parts[2]))
+                r = max(0, min(255, r))
+                g = max(0, min(255, g))
+                b = max(0, min(255, b))
+                return QColor(r, g, b)
+        except Exception:
+            pass
+
+        return QColor(255, 255, 255)
+
+    def _set_from_qcolor(self, c: QColor):
+        r, g, b, _a = c.getRgb()
+        self.line.setText(f"{r},{g},{b}")
+
+    def _sync_button(self):
+        c = self._parse_to_qcolor()
+        # swatch background
+        self.btn.setStyleSheet(
+            f"QPushButton {{ background-color: {c.name()}; border: 1px solid #666; border-radius: 3px; }}"
+        )
+
+    def _pick_color(self):
+        initial = self._parse_to_qcolor()
+        c = QColorDialog.getColor(
+            initial,
+            self,
+            "Pick Color",
+            QColorDialog.DontUseNativeDialog  # gives full picker UI reliably
+        )
+        if c.isValid():
+            self._set_from_qcolor(c)
+
+    def value(self) -> str:
+        return self.line.text().strip()
 # -----------------------------------------------------------------------------
 # Dynamic Settings Widget
 # -----------------------------------------------------------------------------
@@ -416,7 +494,13 @@ class StageSettingsWidget(QWidget):
                 container.toggled.connect(self._on_change)
                 container.widget = container
 
-            # 5. File/String
+            # 5. Color (explicit UI hint or common name convention)
+            elif ptype == "color" or name.startswith("custom_color"):
+                container = ColorParam(name, str(val))
+                container.line.textChanged.connect(self._on_change)
+                container.widget = container
+
+            # 6. File/String
             else:
                 container = QWidget()
                 l = QHBoxLayout(container)

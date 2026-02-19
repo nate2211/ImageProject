@@ -57,7 +57,7 @@ except Exception:
     win32gui = None
     win32con = None
     ctypes = None
-
+from time import perf_counter
 # =============== Logging ===============
 log = logging.getLogger("imagegen")
 
@@ -71,9 +71,10 @@ def setup_logging(verbosity: int = 0) -> None:
     )
 
 class FFMpegWriter:
-    def __init__(self, path: str, w: int, h: int, fps: float, crf: int = 18, preset: str = "veryfast"):
+    def __init__(self, path: str, w: int, h: int, fps: float, crf: int = 18, preset: str = "veryfast", ffmpeg_bin: str = "ffmpeg"):
+        ffmpeg_path = _resolve_ffmpeg(ffmpeg_bin)
         self.proc = subprocess.Popen(
-            ["ffmpeg", "-y",
+            [ffmpeg_path, "-y",
              "-f", "rawvideo", "-pix_fmt", "bgr24", "-s", f"{w}x{h}", "-r", f"{fps}", "-i", "-",
              "-an",
              "-c:v", "libx264", "-preset", preset, "-crf", str(crf),
@@ -200,6 +201,199 @@ class ImageLoader:
         return img
 
 
+
+def _is_video_path_or_url(src: str, content_type: Optional[str]) -> bool:
+    if content_type and content_type.lower().startswith("video/"):
+        return True
+    p = urlparse(src)
+    path = (p.path or src).lower()
+    return any(path.endswith(ext) for ext in (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v"))
+
+def _is_video_output_path(p: Path) -> bool:
+    return p.suffix.lower() in (".mp4", ".mov", ".mkv", ".avi", ".webm", ".m4v")
+
+def _resolve_ffprobe(ffmpeg_bin: str) -> str:
+    ffmpeg_path = _resolve_ffmpeg(ffmpeg_bin)
+    # If ffmpeg is ".../ffmpeg(.exe)" assume ffprobe sits next to it; else fallback to PATH.
+    ffprobe = str(Path(ffmpeg_path).with_name("ffprobe.exe" if os.name == "nt" else "ffprobe"))
+    if Path(ffprobe).exists():
+        return ffprobe
+    hit = shutil.which("ffprobe")
+    if hit:
+        return hit
+    raise FileNotFoundError("ffprobe not found (needed for video input). Install FFmpeg full build (ffmpeg+ffprobe).")
+
+def _ffprobe_size_and_fps(src: str, ffmpeg_bin: str = "ffmpeg") -> Tuple[int, int, float]:
+    ffprobe = _resolve_ffprobe(ffmpeg_bin)
+    # width,height,r_frame_rate
+    cmd = [
+        ffprobe, "-v", "error",
+        "-select_streams", "v:0",
+        "-show_entries", "stream=width,height,r_frame_rate",
+        "-of", "default=nw=1:nk=1",
+        src
+    ]
+    out = subprocess.check_output(cmd, stderr=subprocess.STDOUT).decode("utf-8", errors="ignore").strip().splitlines()
+    if len(out) < 3:
+        raise RuntimeError(f"ffprobe failed to read stream info for: {src}")
+    w = int(out[0].strip())
+    h = int(out[1].strip())
+    fr = out[2].strip()
+    # r_frame_rate like "30000/1001"
+    if "/" in fr:
+        a, b = fr.split("/", 1)
+        fps = float(a) / float(b) if float(b) != 0 else 30.0
+    else:
+        fps = float(fr) if fr else 30.0
+    return w, h, fps
+
+def _read_exact(stream, n: int) -> bytes:
+    buf = bytearray()
+    while len(buf) < n:
+        chunk = stream.read(n - len(buf))
+        if not chunk:
+            break
+        buf += chunk
+    return bytes(buf)
+
+def _iter_video_frames_raw_bgr24(
+    src: str,
+    *,
+    ffmpeg_bin: str = "ffmpeg",
+    max_size: Optional[int] = None,
+    target_fps: Optional[float] = None,
+):
+    ffmpeg_path = _resolve_ffmpeg(ffmpeg_bin)
+    in_w, in_h, in_fps = _ffprobe_size_and_fps(src, ffmpeg_bin=ffmpeg_bin)
+
+    # Decide output size up front (and FORCE ffmpeg to match it)
+    out_w, out_h = in_w, in_h
+    if max_size and max_size > 0 and max(in_w, in_h) > max_size:
+        if in_w >= in_h:
+            out_w = int(max_size)
+            out_h = int(round(in_h * (out_w / in_w)))
+        else:
+            out_h = int(max_size)
+            out_w = int(round(in_w * (out_h / in_h)))
+
+        # make even (important for many encoders + consistency)
+        out_w = max(2, (out_w // 2) * 2)
+        out_h = max(2, (out_h // 2) * 2)
+
+    out_fps = float(target_fps) if (target_fps and target_fps > 0) else float(in_fps or 30.0)
+
+    vf_parts = []
+    if target_fps and target_fps > 0:
+        vf_parts.append(f"fps={float(target_fps)}")
+    # force exact scale if requested (or if you want, always force scale=out_w:out_h)
+    if (out_w, out_h) != (in_w, in_h):
+        vf_parts.append(f"scale={out_w}:{out_h}")
+
+    vf = ",".join(vf_parts) if vf_parts else None
+
+    cmd = [ffmpeg_path, "-hide_banner", "-nostats", "-loglevel", "error", "-i", src]
+    if vf:
+        cmd += ["-vf", vf]
+    cmd += ["-pix_fmt", "bgr24", "-f", "rawvideo", "-an", "-sn", "-dn", "-"]
+
+    proc = subprocess.Popen(
+        cmd,
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        creationflags=getattr(subprocess, "CREATE_NO_WINDOW", 0) if os.name == "nt" else 0,
+        bufsize=0,
+    )
+    if proc.stdout is None or proc.stderr is None:
+        raise RuntimeError("Failed to start ffmpeg video decode (no pipes).")
+
+    drainer = _PipeDrainer(proc.stderr)
+    drainer.start()
+
+    frame_bytes = out_w * out_h * 3
+
+    def gen():
+        try:
+            while True:
+                buf = _read_exact(proc.stdout, frame_bytes)
+                if not buf:
+                    break
+                if len(buf) < frame_bytes:
+                    err = drainer.last_text()
+                    rc = proc.poll()
+                    raise RuntimeError(
+                        f"Short read from ffmpeg (got {len(buf)} of {frame_bytes}). rc={rc}\n"
+                        f"ffmpeg stderr:\n{err}"
+                    )
+                frame = np.frombuffer(buf, np.uint8).reshape(out_h, out_w, 3)  # BGR
+                yield Image.fromarray(frame[:, :, ::-1])
+        finally:
+            try:
+                proc.kill()
+            except Exception:
+                pass
+            drainer.stop()
+
+    return out_w, out_h, out_fps, gen()
+def _run_video_pipeline(
+    *,
+    src: str,
+    out_path: Path,
+    stages: List[str],
+    stage_extras: List[Dict[str, Any]],
+    seed: Optional[int],
+    max_size: Optional[int],
+    scale: int,
+    ffmpeg_bin: str = "ffmpeg",
+    video_fps: Optional[float] = None,
+    crf: int = 18,
+    preset: str = "veryfast",
+) -> None:
+    gens = [REGISTRY.create(name, seed=seed) for name in stages]
+
+    w, h, fps, frames = _iter_video_frames_raw_bgr24(
+        src, ffmpeg_bin=ffmpeg_bin, max_size=max_size, target_fps=video_fps
+    )
+
+    # We may upscale AFTER pipeline (your existing semantics).
+    # Writer expects final output size.
+    writer = None
+    riter = None
+    t0 = perf_counter()
+    last_log = t0
+    n = 0
+
+    try:
+        for img in frames:
+            out = _run_pipeline_instances(img, gens, stage_extras)
+
+            if scale and scale > 1:
+                out = out.resize((out.width * scale, out.height * scale), Image.Resampling.LANCZOS)
+
+            if writer is None:
+                out_path.parent.mkdir(parents=True, exist_ok=True)
+                writer = FFMpegWriter(
+                    str(out_path), out.width, out.height, fps,
+                    crf=crf, preset=preset, ffmpeg_bin=ffmpeg_bin
+                )
+                print(f"Video: {out.width}x{out.height} @ {fps:.3f} fps → {out_path}")
+
+            writer.write_bgr(_pil_to_bgr(out))
+
+            n += 1
+            now = perf_counter()
+            if now - last_log >= 1.0:  # log once per second
+                elapsed = now - t0
+                eff_fps = n / elapsed if elapsed > 0 else 0.0
+                print(f"Processed {n} frames | {eff_fps:.2f} fps (effective)")
+                last_log = now
+
+        if writer is None:
+            raise RuntimeError("No frames decoded from input video.")
+    finally:
+        if writer is not None:
+            writer.close()
+            print(f"Done. Wrote {n} frames to {out_path}")
 # =============== Small CLI helpers ===============
 def _coerce(v: str) -> Any:
     if v.isdigit():
@@ -384,14 +578,18 @@ def cmd_list(_args: argparse.Namespace) -> int:
     return 0
 
 
+def _normalize_src_for_ffmpeg(src: str) -> str:
+    p = urlparse(src)
+    if (p.scheme or "").lower() == "file":
+        local_path = unquote(p.path)
+        if os.name == "nt" and local_path.startswith("/"):
+            local_path = local_path[1:]
+        return local_path
+    return src
+
 def cmd_run(args: argparse.Namespace) -> int:
     try:
-        fetcher = FileFetcher()
-        loader = ImageLoader()
-
-        raw, ctype = fetcher.fetch(args.url)
-        src_img = loader.load(raw, ctype, max_size=args.max_size)
-
+        # Parse pipeline first (so errors show early)
         stages = _parse_pipeline(args.pipeline, args.generator)
         unknown = [s for s in stages if s not in REGISTRY.names()]
         if unknown:
@@ -399,6 +597,43 @@ def cmd_run(args: argparse.Namespace) -> int:
 
         raw_extras = _parse_kv_pairs(args.extra)
         stage_extras = _split_stage_extras(stages, raw_extras)
+
+        # Decide whether this is video mode
+        # NOTE: content_type is unknown here unless you fetch; use extension + out suffix.
+        video_out = _is_video_output_path(args.out)
+        video_in = _is_video_path_or_url(args.url, content_type=None)
+        if video_in or video_out:
+            src_for_ffmpeg = _normalize_src_for_ffmpeg(args.url)
+
+            # Optional: allow these via --extra if you want (simple defaults here)
+            ffmpeg_bin = str(raw_extras.get("ffmpeg_bin", "ffmpeg"))
+            video_fps = raw_extras.get("video_fps", None)
+            video_fps = float(video_fps) if video_fps is not None else None
+            crf = int(raw_extras.get("crf", 18))
+            preset = str(raw_extras.get("preset", "veryfast"))
+
+            _run_video_pipeline(
+                src=src_for_ffmpeg,
+                out_path=args.out,
+                stages=stages,
+                stage_extras=stage_extras,
+                seed=args.seed,
+                max_size=int(args.max_size) if args.max_size else None,
+                scale=int(args.scale) if args.scale else 1,
+                ffmpeg_bin=ffmpeg_bin,
+                video_fps=video_fps,
+                crf=crf,
+                preset=preset,
+            )
+            log.info("Saved video %s", args.out)
+            return 0
+
+        # ---- IMAGE MODE (your existing behavior) ----
+        fetcher = FileFetcher()
+        loader = ImageLoader()
+
+        raw, ctype = fetcher.fetch(args.url)
+        src_img = loader.load(raw, ctype, max_size=args.max_size)
 
         out_img = _run_pipeline(src_img, stages, stage_extras, seed=args.seed)
 
@@ -411,6 +646,7 @@ def cmd_run(args: argparse.Namespace) -> int:
         out_img.save(args.out, format=fmt, optimize=True)
         log.info("Saved %s (%dx%d)", args.out, *out_img.size)
         return 0
+
     except MemoryError:
         log.error("MemoryError: try lowering palette_voronoi work_mp, max_ram_mb, or grid; and set precision=f16.")
         return 1
@@ -808,7 +1044,15 @@ def _find_hwnd_by_title_like(query: str) -> Optional[int]:
     return exact_hwnd or substr_hwnd  # Return exact match if found, else substring
 def _format_hwnd(hwnd: int) -> str:
     return f"0x{hwnd:08x}"
-
+def _run_pipeline_instances(
+    img: Image.Image,
+    gens: List[Any],
+    stage_extras: List[Dict[str, Any]],
+) -> Image.Image:
+    out = img
+    for gen, extras in zip(gens, stage_extras):
+        out = gen.generate(out, **extras)
+    return out
 # =============== Streaming ===============
 def cmd_stream(args: argparse.Namespace) -> int:
     """Capture → pipeline → preview (and optional video write) with stable high FPS and correct lifetimes."""
@@ -845,11 +1089,13 @@ def cmd_stream(args: argparse.Namespace) -> int:
     # ---- Build pipeline ----
     try:
         stages = _parse_pipeline(args.pipeline, args.generator)
+
         unknown = [s for s in stages if s not in REGISTRY.names()]
         if unknown:
             raise SystemExit(f"Unknown generator(s): {', '.join(unknown)}")
         raw_extras = _parse_kv_pairs(args.extra)
         stage_extras = _split_stage_extras(stages, raw_extras)
+
     except Exception as e:
         log.exception("Pipeline build failed: %s", e)
         return 1
@@ -860,7 +1106,7 @@ def cmd_stream(args: argparse.Namespace) -> int:
     max_size = int(args.max_size) if args.max_size and args.max_size > 0 else None
     seed = args.seed
     t_end = (time.time() + float(args.dur)) if args.dur and args.dur > 0 else None
-
+    gens = [REGISTRY.create(name, seed=seed) for name in stages]
     preview_name = "imagegen stream"
     show = bool(args.preview and cv2 is not None)
     zoom = float(args.preview_zoom or 1.0)
@@ -879,8 +1125,7 @@ def cmd_stream(args: argparse.Namespace) -> int:
             proc = proc.copy()
             proc.thumbnail((max_size, max_size), Image.Resampling.LANCZOS)
 
-        out = _run_pipeline(proc, stages, stage_extras, seed=seed)
-
+        out = _run_pipeline_instances(proc, gens, stage_extras)
         if not base_size_ref:
             base_size_ref.append(out.size)
 
@@ -976,6 +1221,16 @@ def cmd_stream(args: argparse.Namespace) -> int:
                             else:
                                 # Should not happen in native mode, but keep safe
                                 writer.write(_pil_to_bgr(out))
+                        now = perf_counter()
+                        if now < next_t:
+                            sleep(min(0.002, next_t - now))
+                            # keep the newest frame by continuing; OR you can process anyway.
+                            # I'd continue to keep timing stable:
+                            continue
+
+                        # If we're *very* behind, drop frames until we're close again
+                        if now - next_t > 2 * frame_dt:
+                            next_t = now  # jump forward; effectively drops backlog
 
                         # pacing
                         now = perf_counter()
@@ -1061,39 +1316,76 @@ def cmd_stream(args: argparse.Namespace) -> int:
         log.info("Streaming %s @ %.1f FPS. Ctrl+C to stop.", region_desc, target_fps)
 
         try:
+            # ---- inside cmd_stream, MSS path ----
+
+            latest = deque(maxlen=1)
+            stop_ev = threading.Event()
+
+            def capture_loop():
+                # Capture as fast as possible (or you can pace this too)
+                while not stop_ev.is_set():
+                    try:
+                        raw = sct.grab(bbox)
+                        # Keep newest only (deque maxlen=1)
+                        latest.append(raw)
+                    except Exception:
+                        # tiny backoff
+                        time.sleep(0.002)
+
+            cap_t = threading.Thread(target=capture_loop, daemon=True)
+            cap_t.start()
+
             next_t = perf_counter()
-            while True:
-                if t_end and time.time() >= t_end:
-                    break
 
-                if args.window and args.follow_window:
-                    wb = _get_window_bbox_windows(args.window, trim=int(args.window_trim))
-                    if wb is not None:
-                        bbox = wb
+            try:
+                while True:
+                    if t_end and time.time() >= t_end:
+                        break
 
-                raw = sct.grab(bbox)
-                img = Image.frombytes("RGB", (raw.width, raw.height), raw.rgb)
+                    # If following window, update bbox (capture thread will use new bbox next loop)
+                    if args.window and args.follow_window:
+                        wb = _get_window_bbox_windows(args.window, trim=int(args.window_trim))
+                        if wb is not None:
+                            bbox = wb
 
-                out = process_frame(img, lock_to_base=bool(args.lock_base_size or writer is not None))
+                    now = perf_counter()
+                    if now < next_t:
+                        sleep(min(0.002, next_t - now))
+                        continue
 
-                if show:
-                    cv2.imshow(preview_name, _pil_to_bgr(out))
-                    cv2.waitKey(1)
+                    if not latest:
+                        # no frame yet
+                        sleep(0.001)
+                        continue
 
-                if writer is not None:
-                    # Ensure size matches writer expectations
-                    if out.size != base_size:
-                        out = out.resize(base_size, Image.Resampling.LANCZOS)
-                    writer.write(_pil_to_bgr(out))
+                    raw = latest.pop()  # newest frame
+                    # IMPORTANT: mss raw is BGRA; use that to avoid extra conversions
+                    img = Image.frombuffer("RGB", (raw.width, raw.height), raw.bgra, "raw", "BGRX", 0, 1)
 
-                # pacing
-                now = perf_counter()
-                next_t += frame_dt
-                dt = next_t - now
-                if dt > 0.001:
-                    sleep(dt)
-                elif dt < -0.2:
-                    next_t = now
+                    t0 = perf_counter()
+                    out = process_frame(img, lock_to_base=bool(args.lock_base_size or writer is not None))
+                    t1 = perf_counter()
+
+                    if show:
+                        cv2.imshow(preview_name, _pil_to_bgr(out))
+                        cv2.waitKey(1)
+
+                    if writer is not None:
+                        if out.size != base_size:
+                            out = out.resize(base_size, Image.Resampling.LANCZOS)
+                        writer.write(_pil_to_bgr(out))
+
+                    next_t += frame_dt
+                    if t1 - next_t > 2 * frame_dt:
+                        next_t = t1
+
+            finally:
+                stop_ev.set()
+                try:
+                    cap_t.join(timeout=0.5)
+                except Exception:
+                    pass
+
 
         except KeyboardInterrupt:
             pass

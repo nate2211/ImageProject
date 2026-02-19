@@ -1,5 +1,6 @@
 """
 content.py — photo-safe ContentGenerator (no cell-division / no mosaic)
+Rewritten with introspection for GUI parameter discovery.
 
 What this does
 --------------
@@ -9,25 +10,20 @@ What this does
   before it and route a safe default `learn_profile.out`.
 • Potent, guarded presets: crisper enhancements and stronger (but safe) profile tints.
 • Extra safety clamps: caps for overlay strength, quantization off, non-cell motifs only.
-• Helpful logs for dry runs and ignored extras.
-
-How to run (examples)
----------------------
-# Soft enhancement
-python main.py run --url input.jpg --generator content --out out.png --extra plan=enhance_soft
-
-# Stronger "pop" (still natural)
-python main.py run --url input.jpg --generator content --out out.png --extra plan=enhance_crisp
-
-# Profile-tinted overlay (still photo-safe)
-python main.py run --url input.jpg --generator content --out out.png --extra plan=profile_tint_plus
 """
 from __future__ import annotations
 
 from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
-from main import log
+# We assume main.log and palettes.REGISTRY exist in your project structure
+# If running standalone, you might need to adjust imports.
+try:
+    from main import log
+except ImportError:
+    import logging
+    log = logging.getLogger("content")
+
 from palettes import REGISTRY  # type: ignore
 
 # ---------------------------- Safety configuration ---------------------------- #
@@ -108,11 +104,6 @@ def _split_stage_extras(stages: List[str], raw_extras: Dict[str, Any]) -> List[D
 def _sanitize_profile_context(extras: Dict[str, Any]) -> Dict[str, Any]:
     """
     Harden profile_context extras so it cannot introduce cell visuals or muddy detail.
-    • Force overlay + preserve_details (luminance from base image).
-    • Enforce motif to one of SAFE_OVERLAY_MOTIFS (default 'clouds').
-    • Clamp overlay_alpha and enforce strong edge_protect.
-    • Disable quantization; soften style knobs if not provided.
-    • Zero out geometry-ish influences (density/orient).
     """
     safe = dict(extras)
 
@@ -159,11 +150,7 @@ def _sanitize_profile_context(extras: Dict[str, Any]) -> Dict[str, Any]:
 
 def _ensure_profile_wiring(stages: List[str], stage_extras: List[Dict[str, Any]]) -> Tuple[List[str], List[Dict[str, Any]]]:
     """
-    If there's a `profile_context` stage without a profile path:
-      • Insert a `learn_profile` just before the first `profile_context`.
-      • Route learn_profile.out and profile_context.profile to DEFAULT_PROFILE_PATH
-      (unless the user already set either).
-    Also sanitize the profile_context extras unconditionally.
+    If there's a `profile_context` stage without a profile path, insert `learn_profile`.
     """
     if "profile_context" not in stages:
         return stages, stage_extras
@@ -221,7 +208,6 @@ class Preset:
     description: str = ""
 
 PRESETS: Dict[str, Preset] = {
-    # Natural enhancement (gentle)
     "enhance_soft": Preset(
         pipeline="photo_enhance",
         extras=dict(
@@ -233,8 +219,6 @@ PRESETS: Dict[str, Preset] = {
         ),
         description="Gentle, natural photo polish.",
     ),
-
-    # Potent but safe “pop”: crisper micro-contrast with guards
     "enhance_crisp": Preset(
         pipeline="photo_enhance",
         extras=dict(
@@ -246,10 +230,8 @@ PRESETS: Dict[str, Preset] = {
             clarity_halo_guard=0.45, sharpen_threshold=0.10,
             vibrance=0.12, gamut_guard=0.65, noise_floor=0.14, lc_mid_bias=0.58,
         ),
-        description="Crisp detail and punchy mids with halo/noise/gamut guards.",
+        description="Crisp detail and punchy mids.",
     ),
-
-    # Low-light recovery with more denoise
     "enhance_lowlight": Preset(
         pipeline="photo_enhance",
         extras=dict(
@@ -262,8 +244,6 @@ PRESETS: Dict[str, Preset] = {
         ),
         description="Low-light clean-up with guarded contrast.",
     ),
-
-    # Learn + gentle overlay + enhance (still content-preserving)
     "profile_tint_soft": Preset(
         pipeline="learn_profile|profile_context|photo_enhance",
         extras={
@@ -278,10 +258,8 @@ PRESETS: Dict[str, Preset] = {
             "photo_enhance.tone": "soft",
             "photo_enhance.tone_strength": 0.55,
         },
-        description="Learn global color cues, apply a gentle overlay (no cells), then enhance.",
+        description="Learn global color cues, apply a gentle overlay.",
     ),
-
-    # Stronger, yet safe profile tint with extra guards
     "profile_tint_plus": Preset(
         pipeline="learn_profile|profile_context|photo_enhance",
         extras={
@@ -301,7 +279,7 @@ PRESETS: Dict[str, Preset] = {
             "photo_enhance.vibrance": 0.12,
             "photo_enhance.gamut_guard": 0.70,
         },
-        description="A bit more color presence from the profile without touching geometry.",
+        description="A bit more color presence from the profile.",
     ),
 }
 
@@ -312,24 +290,82 @@ PRESETS: Dict[str, Preset] = {
 class ContentGenerator:
     """
     High-level meta-generator with a strict safety allow-list.
-
-    Modes
-    -----
-    • Preset mode:  --extra plan=NAME  (alias: preset=NAME)
-    • Ad-hoc mode:  --extra pipeline="g1|g2|..."
-
-    Safety
-    ------
-    • Only SAFE_STAGES are allowed.
-    • Any 'profile_context' is sanitized to overlay mode with detail-preserving
-      settings and non-cell motifs.
-    • If 'profile_context' lacks a profile path, a 'learn_profile' is inserted
-      automatically with a safe default output path.
     """
     seed: Optional[int] = None
     strict: bool = True
     allow_unknown: bool = False
     default_plan: str = "enhance_crisp"
+
+    # -------- introspection for GUI --------
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        """
+        Return the definition of parameters for GUI generation.
+        Includes meta-parameters (plan, strict) and common override knobs.
+        """
+        presets = sorted(PRESETS.keys())
+        return [
+            # Meta controls
+            {
+                "name": "plan",
+                "type": str,
+                "default": "enhance_crisp",
+                "choices": presets,
+                "help": "Pre-configured pipeline strategy."
+            },
+            {
+                "name": "strict",
+                "type": bool,
+                "default": True,
+                "help": "If True, errors on unknown stages. If False, ignores them."
+            },
+            {
+                "name": "dry_run",
+                "type": bool,
+                "default": False,
+                "help": "Log the pipeline plan without processing pixels."
+            },
+
+            # Common overrides (Photo Enhance)
+            # These allow tweaking the underlying stages without writing manual extras
+            {
+                "name": "photo_enhance.denoise",
+                "type": float,
+                "default": 0.12,
+                "min": 0.0, "max": 1.0,
+                "help": "Override denoise strength for enhance plans."
+            },
+            {
+                "name": "photo_enhance.clarity",
+                "type": float,
+                "default": 0.38,
+                "min": 0.0, "max": 1.0,
+                "help": "Override clarity/sharpness strength."
+            },
+            {
+                "name": "photo_enhance.saturation",
+                "type": float,
+                "default": 1.05,
+                "min": 0.0, "max": 2.0,
+                "help": "Override global saturation."
+            },
+
+            # Common overrides (Profile Context)
+            {
+                "name": "profile_context.overlay_alpha",
+                "type": float,
+                "default": 0.28,
+                "min": 0.0, "max": 0.45, # Clamped by safety rules anyway
+                "help": "Opacity of the color overlay (tint plans only)."
+            },
+            {
+                "name": "profile_context.motif",
+                "type": str,
+                "default": "clouds",
+                "choices": ["clouds", "waves", "stripes"],
+                "help": "Pattern style for the overlay (tint plans only)."
+            },
+        ]
 
     # -------- public helpers --------
     @staticmethod

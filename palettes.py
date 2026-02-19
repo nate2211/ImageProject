@@ -3,11 +3,12 @@ from __future__ import annotations
 import io
 import os
 from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List, Any
 
 import numpy as np
 import requests
 from PIL import Image
+
 
 # =============== Registry ===============
 class GeneratorRegistry:
@@ -35,8 +36,14 @@ REGISTRY = GeneratorRegistry()
 @dataclass
 class BaseGenerator:
     seed: Optional[int] = None
+
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:  # pragma: no cover
         raise NotImplementedError
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        """Return a list of dicts describing the parameters for GUI generation."""
+        return []
 
 
 def _rng(seed: Optional[int]) -> np.random.Generator:
@@ -49,13 +56,16 @@ def _parse_hex_color(code: str) -> Tuple[float, float, float]:
         s = "".join([c * 2 for c in s])
     if len(s) != 6:
         return (17.0, 17.0, 17.0)
-    r = int(s[0:2], 16); g = int(s[2:4], 16); b = int(s[4:6], 16)
+    r = int(s[0:2], 16);
+    g = int(s[2:4], 16);
+    b = int(s[4:6], 16)
     return float(r), float(g), float(b)
 
 
 # --- Blurs (shape-preserving, no SciPy) ---
 def _box_blur_gray(field: np.ndarray, k: int) -> np.ndarray:
-    k = max(1, int(k));  k += (k % 2 == 0)
+    k = max(1, int(k));
+    k += (k % 2 == 0)
     r = k // 2
     fp = np.pad(field, ((0, 0), (r, r)), mode="reflect")
     c = np.pad(fp, ((0, 0), (1, 0)), mode="constant").cumsum(axis=1, dtype=np.float64)
@@ -67,7 +77,8 @@ def _box_blur_gray(field: np.ndarray, k: int) -> np.ndarray:
 
 
 def _box_blur(img: Image.Image, k: int) -> Image.Image:
-    k = max(1, int(k));  k += (k % 2 == 0)
+    k = max(1, int(k));
+    k += (k % 2 == 0)
     r = k // 2
     arr = np.asarray(img.convert("RGB"), dtype=np.float32)
     fp = np.pad(arr, ((0, 0), (r, r), (0, 0)), mode="reflect")
@@ -128,65 +139,97 @@ def _map_field_to_palette(field01: np.ndarray, palette: np.ndarray) -> np.ndarra
     out = (c0 * (1 - frac) + c1 * frac).reshape(h, w, 3)
     return np.clip(out, 0, 255)
 
+
 def _open_image_any(src: str) -> Image.Image:
     if src.lower().startswith(("http://", "https://")):
-        r = requests.get(src, timeout=30); r.raise_for_status()
-        im = Image.open(io.BytesIO(r.content)); im.load(); return im.convert("RGB")
+        r = requests.get(src, timeout=30);
+        r.raise_for_status()
+        im = Image.open(io.BytesIO(r.content));
+        im.load();
+        return im.convert("RGB")
     if src.lower().startswith("file://"):
         from urllib.parse import urlparse, unquote
         p = unquote(urlparse(src).path)
         if os.name == "nt" and p.startswith("/"): p = p[1:]
-        im = Image.open(p); im.load(); return im.convert("RGB")
-    im = Image.open(src); im.load(); return im.convert("RGB")
+        im = Image.open(p);
+        im.load();
+        return im.convert("RGB")
+    im = Image.open(src);
+    im.load();
+    return im.convert("RGB")
+
+
 def _down(img: Image.Image, w: int) -> Image.Image:
     r = w / max(1, img.width)
     h = max(1, int(img.height * r))
     return img.resize((w, h), Image.Resampling.LANCZOS).convert("RGB")
 
+
 def _photo_elements(img: Image.Image, *, bins: int = 64) -> dict:
     """Very low-freq features from the real photo (no fine structure)."""
     small = _down(img, 256)
     arr = np.asarray(small, np.float32)
-    gray = (0.299*arr[...,0] + 0.587*arr[...,1] + 0.114*arr[...,2]) / 255.0
+    gray = (0.299 * arr[..., 0] + 0.587 * arr[..., 1] + 0.114 * arr[..., 2]) / 255.0
 
     # --- color ramp by luminance bins (avg RGB per bin) ---
-    q = np.clip((gray * (bins-1)).astype(np.int32), 0, bins-1)
-    ramp = np.zeros((bins,3), np.float32); counts = np.bincount(q.ravel(), minlength=bins).astype(np.float32)+1e-6
+    q = np.clip((gray * (bins - 1)).astype(np.int32), 0, bins - 1)
+    ramp = np.zeros((bins, 3), np.float32);
+    counts = np.bincount(q.ravel(), minlength=bins).astype(np.float32) + 1e-6
     for c in range(3):
-        ramp[:,c] = np.bincount(q.ravel(), weights=arr[...,c].ravel(), minlength=bins).astype(np.float32)/counts
+        ramp[:, c] = np.bincount(q.ravel(), weights=arr[..., c].ravel(), minlength=bins).astype(np.float32) / counts
 
     # --- orientation via gradient histogram (dominant direction) ---
     gy, gx = np.gradient(gray)
     mag = np.hypot(gx, gy) + 1e-8
     ang = (np.arctan2(gy, gx) + np.pi) % np.pi  # [0,pi)
     hist, edges = np.histogram(ang, bins=36, weights=mag)
-    dom_idx = int(hist.argmax()); dom_theta = 0.5*(edges[dom_idx]+edges[dom_idx+1])  # radians
+    dom_idx = int(hist.argmax());
+    dom_theta = 0.5 * (edges[dom_idx] + edges[dom_idx + 1])  # radians
 
     # --- horizon guess: row of max horizontal energy (blurred) ---
     horiz_energy = np.mean(np.abs(gy), axis=1)
     horiz_energy = (horiz_energy - horiz_energy.min()) / (np.ptp(horiz_energy) + 1e-8)
     if horiz_energy.max() > 0.25:
-        y_hat = int(np.argmax(_box_blur_gray(horiz_energy[None,:], 9).ravel()))
-        horizon = y_hat / (gray.shape[0]-1)
+        y_hat = int(np.argmax(_box_blur_gray(horiz_energy[None, :], 9).ravel()))
+        horizon = y_hat / (gray.shape[0] - 1)
     else:
         horizon = None
 
     # --- soft composition density (edges + luma dev), then blur hard ---
     edge_mag = (mag / mag.max()).astype(np.float32)
-    luma_dev = np.abs(gray - gray.mean()); luma_dev /= (luma_dev.max()+1e-8)
-    density = 0.6*edge_mag + 0.4*luma_dev
+    luma_dev = np.abs(gray - gray.mean());
+    luma_dev /= (luma_dev.max() + 1e-8)
+    density = 0.6 * edge_mag + 0.4 * luma_dev
     density = _box_blur_gray(density, 31)  # heavy blur → only low-freq layout
-    density /= (density.sum()+1e-8)
+    density /= (density.sum() + 1e-8)
 
     return {"ramp": ramp, "theta": float(dom_theta), "horizon": horizon, "density": density, "gray": gray}
 
+
 def _map_with_ramp(field01: np.ndarray, ramp: np.ndarray) -> np.ndarray:
-    idx = np.clip((field01 * (len(ramp)-1)).astype(np.int32), 0, len(ramp)-1)
+    idx = np.clip((field01 * (len(ramp) - 1)).astype(np.int32), 0, len(ramp) - 1)
     return ramp[idx]
+
+
 # =============== Generators ===============
 @dataclass
 class EdgeArtGenerator(BaseGenerator):
     """Sobel edges + tinted composite."""
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            {"name": "thresh", "type": float, "default": 0.20, "min": 0.0, "max": 1.0,
+             "help": "Edge detection sensitivity."},
+            {"name": "tint", "type": str, "default": "#00ffff", "help": "Hex color for the edges."},
+            {"name": "alpha", "type": float, "default": 0.80, "min": 0.0, "max": 1.0, "help": "Opacity of the edges."},
+            {"name": "mix", "type": float, "default": 0.35, "min": 0.0, "max": 1.0,
+             "help": "Blend between source and background."},
+            {"name": "invert", "type": bool, "default": False, "help": "Invert the edge mask."},
+            {"name": "bg", "type": str, "default": "black", "choices": ["black", "white", "avg"],
+             "help": "Background style."}
+        ]
+
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         thresh = float(kwargs.get("thresh", 0.20))
         tint = str(kwargs.get("tint", "#00ffff"))
@@ -212,7 +255,8 @@ class EdgeArtGenerator(BaseGenerator):
                     out[y, x] = float((im[ys, xs] * k).sum())
             return out
 
-        gx = conv2d(gray, kx); gy = conv2d(gray, ky)
+        gx = conv2d(gray, kx);
+        gy = conv2d(gray, ky)
         mag = np.sqrt(gx * gx + gy * gy)
         mag /= (mag.max() + 1e-8)
         edges = (1.0 - (mag > thresh).astype(np.float32)) if invert else (mag > thresh).astype(np.float32)
@@ -236,12 +280,22 @@ class EdgeArtGenerator(BaseGenerator):
 @dataclass
 class MosaicGenerator(BaseGenerator):
     """Pixel mosaic (fast, tiny memory)."""
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            {"name": "tile", "type": int, "default": 16, "min": 2, "max": 128, "help": "Size of the mosaic blocks."},
+            {"name": "softness", "type": float, "default": 0.15, "min": 0.0, "max": 1.0,
+             "help": "Pre-blur amount to reduce noise."}
+        ]
+
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         tile = max(2, int(kwargs.get("tile", 16)))
         softness = float(kwargs.get("softness", 0.15))
         img = input_image.convert("RGB")
         if softness > 0:
-            k = max(1, int(softness * 6));  k += (k % 2 == 0)
+            k = max(1, int(softness * 6));
+            k += (k % 2 == 0)
             img = _box_blur(img, k)
         w, h = img.size
         down = (max(1, w // tile), max(1, h // tile))
@@ -251,6 +305,19 @@ class MosaicGenerator(BaseGenerator):
 @dataclass
 class PaletteFBMGenerator(BaseGenerator):
     """FBM noise recolored with palette from the source."""
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            {"name": "colors", "type": int, "default": 5, "min": 2, "max": 16,
+             "help": "Number of palette colors to extract."},
+            {"name": "octaves", "type": int, "default": 6, "min": 1, "max": 8, "help": "Detail layers in the noise."},
+            {"name": "persistence", "type": float, "default": 0.55, "min": 0.1, "max": 1.0,
+             "help": "Roughness of the noise."},
+            {"name": "smooth", "type": float, "default": 0.0, "min": 0.0, "max": 2.0,
+             "help": "Blur applied to the noise field."}
+        ]
+
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         rng = _rng(self.seed)
         out_w = int(kwargs.get("width", input_image.width))
@@ -267,14 +334,50 @@ class PaletteFBMGenerator(BaseGenerator):
         img_arr = _map_field_to_palette(field, palette)
         return Image.fromarray(img_arr.astype(np.uint8), "RGB")
 
+
 # ================== PaletteVoronoi (low-RAM, PyCharm-friendly) ==================
 @dataclass
 class PaletteVoronoiGenerator(BaseGenerator):
     """
     Content-aware Voronoi photomosaic (tiling; f16 distances; GC nudges).
-    Memory knobs: work_mp, max_ram_mb, precision('f16'|'f32'), ssaa, min_grid, labels_dtype.
     """
     seed: Optional[int] = None
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            # Core
+            {"name": "sites", "type": int, "default": 600, "min": 50, "max": 5000,
+             "help": "Base number of Voronoi cells."},
+            {"name": "grid", "type": int, "default": 960, "min": 256, "max": 4000,
+             "help": "Internal processing resolution."},
+            # Guidance
+            {"name": "guided", "type": str, "default": "both", "choices": ["both", "edges", "luma", "none"],
+             "help": "How to distribute cells."},
+            {"name": "guide_edges", "type": float, "default": 0.7, "min": 0.0, "max": 1.0,
+             "help": "Influence of edges on cell density."},
+            # Geometry
+            {"name": "relax", "type": int, "default": 2, "min": 0, "max": 10,
+             "help": "Lloyd relaxation steps (uniformity)."},
+            {"name": "jitter", "type": float, "default": 0.08, "min": 0.0, "max": 0.5,
+             "help": "Random noise added to site positions."},
+            # Color & Style
+            {"name": "color_mode", "type": str, "default": "mean", "choices": ["mean", "medoid"],
+             "help": "How to color each cell."},
+            {"name": "shade", "type": float, "default": 0.25, "min": 0.0, "max": 1.0,
+             "help": "Depth shading based on cell size."},
+            {"name": "borders", "type": int, "default": 1, "min": 0, "max": 5,
+             "help": "Border thickness (0 to disable)."},
+            {"name": "border_color", "type": str, "default": "#111111", "help": "Hex color for borders."},
+            {"name": "adaptive_borders", "type": bool, "default": True, "help": "Tint borders based on cell color."},
+            # Post-Process
+            {"name": "smoothness", "type": float, "default": 0.0, "min": 0.0, "max": 1.0,
+             "help": "Guided smoothing of the result."},
+            {"name": "clarity", "type": float, "default": 0.25, "min": 0.0, "max": 1.0,
+             "help": "Unsharp masking strength."},
+            {"name": "ssaa", "type": float, "default": 1.5, "min": 1.0, "max": 3.0,
+             "help": "Super-sampling anti-aliasing factor."}
+        ]
 
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         import gc
@@ -289,7 +392,7 @@ class PaletteVoronoiGenerator(BaseGenerator):
 
         guided = str(kwargs.get("guided", "both")).lower()
         guide_edges_w = float(kwargs.get("guide_edges", 0.7))
-        guide_luma_w  = float(kwargs.get("guide_luma", 0.3))
+        guide_luma_w = float(kwargs.get("guide_luma", 0.3))
         relax = max(0, int(kwargs.get("relax", 2)))
         jitter = float(kwargs.get("jitter", 0.08))
         edge_adherence = float(kwargs.get("edge_adherence", 0.60))
@@ -307,17 +410,17 @@ class PaletteVoronoiGenerator(BaseGenerator):
         site_scale = float(kwargs.get("site_scale", 1.0))
 
         # Photoreal/AA extras
-        smoothness    = float(kwargs.get("smoothness", 0.0))
+        smoothness = float(kwargs.get("smoothness", 0.0))
         clarity_boost = float(kwargs.get("clarity_boost", 0.0))
         line_strength = float(kwargs.get("line_strength", 1.0))
-        ssaa          = float(kwargs.get("ssaa", 1.5))  # 1..3
+        ssaa = float(kwargs.get("ssaa", 1.5))  # 1..3
 
         # Anti-lag / memory knobs
-        work_mp     = float(kwargs.get("work_mp", 1.2))
-        min_grid    = int(kwargs.get("min_grid", 640))
-        max_ram_mb  = float(kwargs.get("max_ram_mb", 256.0))
-        precision   = str(kwargs.get("precision", "f16")).lower()
-        labels_dt   = str(kwargs.get("labels_dtype", "auto")).lower()
+        work_mp = float(kwargs.get("work_mp", 1.2))
+        min_grid = int(kwargs.get("min_grid", 640))
+        max_ram_mb = float(kwargs.get("max_ram_mb", 256.0))
+        precision = str(kwargs.get("precision", "f16")).lower()
+        labels_dt = str(kwargs.get("labels_dtype", "auto")).lower()
 
         # ---------- working grid (auto-capped by work_mp) ----------
         W0 = grid_w_req
@@ -341,7 +444,7 @@ class PaletteVoronoiGenerator(BaseGenerator):
 
         # ---------- guidance fields ----------
         edges_imp = self._edge_importance_from_gray(gray)
-        luma_imp  = self._luma_importance_from_gray(gray)
+        luma_imp = self._luma_importance_from_gray(gray)
         if guided == "edges":
             guide = edges_imp
         elif guided == "luma":
@@ -386,7 +489,7 @@ class PaletteVoronoiGenerator(BaseGenerator):
 
         # row tiling auto-size from max_ram_mb & precision
         bytes_per_val = 2 if precision == "f16" else 4
-        row_chunk = max(72, int((max_ram_mb * (1024**2)) / (max(1, W) * bytes_per_val * 3)))
+        row_chunk = max(72, int((max_ram_mb * (1024 ** 2)) / (max(1, W) * bytes_per_val * 3)))
         row_chunk = min(row_chunk, 512)
         row_chunk = max(64, row_chunk)
 
@@ -453,7 +556,8 @@ class PaletteVoronoiGenerator(BaseGenerator):
             small_rgb = self._yuv_to_rgb(Yb, U, V)
         if abs(saturation - 1.0) > 1e-6:
             Y, U, V = self._rgb_to_yuv(small_rgb)
-            U *= saturation; V *= saturation
+            U *= saturation;
+            V *= saturation
             small_rgb = self._yuv_to_rgb(Y, U, V)
 
         # ---------- borders ----------
@@ -496,17 +600,17 @@ class PaletteVoronoiGenerator(BaseGenerator):
     # ---- streaming Voronoi (tiny peak RAM) ----
     @staticmethod
     def _voronoi_labels_streaming(
-        H: int,
-        W: int,
-        sites01: np.ndarray,
-        edge_map: np.ndarray,
-        edge_w: float,
-        *,
-        row_chunk: int = 256,
-        want_second: bool = False,
-        precision: str = "f16",
-        labels_dtype=np.int16,
-        gc_every: int = 0,
+            H: int,
+            W: int,
+            sites01: np.ndarray,
+            edge_map: np.ndarray,
+            edge_w: float,
+            *,
+            row_chunk: int = 256,
+            want_second: bool = False,
+            precision: str = "f16",
+            labels_dtype=np.int16,
+            gc_every: int = 0,
     ):
         import gc
         use_f16 = (precision == "f16")
@@ -514,7 +618,7 @@ class PaletteVoronoiGenerator(BaseGenerator):
 
         warp_full = (1.0 + edge_w * np.clip(edge_map, 0.0, 1.0)).astype(f_dtype)
         best_idx = np.zeros((H, W), dtype=labels_dtype)
-        best_d2  = np.full((H, W), np.inf, dtype=f_dtype)
+        best_d2 = np.full((H, W), np.inf, dtype=f_dtype)
         second_d2 = np.full((H, W), np.inf, dtype=f_dtype) if want_second else None
 
         xx = np.linspace(0, 1, W, dtype=f_dtype)[None, :]
@@ -523,11 +627,11 @@ class PaletteVoronoiGenerator(BaseGenerator):
         tile_counter = 0
         for y0 in range(0, H, row_chunk):
             y1 = min(H, y0 + row_chunk)
-            h  = y1 - y0
-            yy = np.linspace(y0/(H-1+1e-8), (y1-1)/(H-1+1e-8), h, dtype=f_dtype)[:, None]
+            h = y1 - y0
+            yy = np.linspace(y0 / (H - 1 + 1e-8), (y1 - 1) / (H - 1 + 1e-8), h, dtype=f_dtype)[:, None]
             warp = warp_full[y0:y1, :]
 
-            tile_best_d2  = np.full((h, W), np.inf, dtype=f_dtype)
+            tile_best_d2 = np.full((h, W), np.inf, dtype=f_dtype)
             tile_best_idx = np.zeros((h, W), dtype=labels_dtype)
             tile_second_d2 = np.full((h, W), np.inf, dtype=f_dtype) if want_second else None
 
@@ -548,10 +652,10 @@ class PaletteVoronoiGenerator(BaseGenerator):
                                               np.minimum(tile_second_d2, tile_best_d2),
                                               np.minimum(tile_second_d2, d2))
                 tile_best_idx = np.where(better, i, tile_best_idx)
-                tile_best_d2  = np.minimum(tile_best_d2, d2)
+                tile_best_d2 = np.minimum(tile_best_d2, d2)
 
             best_idx[y0:y1, :] = tile_best_idx
-            best_d2 [y0:y1, :] = tile_best_d2
+            best_d2[y0:y1, :] = tile_best_d2
             if want_second:
                 second_d2[y0:y1, :] = tile_second_d2
 
@@ -597,7 +701,8 @@ class PaletteVoronoiGenerator(BaseGenerator):
     def _edge_importance_from_gray(cls, g: np.ndarray) -> np.ndarray:
         kx = np.array([[-1, 0, 1], [-2, 0, 2], [-1, 0, 1]], np.float32)
         ky = np.array([[-1, -2, -1], [0, 0, 0], [1, 2, 1]], np.float32)
-        gx = cls._conv_valid(g, kx); gy = cls._conv_valid(g, ky)
+        gx = cls._conv_valid(g, kx);
+        gy = cls._conv_valid(g, ky)
         mag = np.sqrt(gx * gx + gy * gy)
         if mag.max() > 1e-8: mag /= mag.max()
         return _box_blur_gray(mag, k=5)
@@ -614,9 +719,9 @@ class PaletteVoronoiGenerator(BaseGenerator):
         im = np.pad(img, pad, mode="reflect")
         out = np.empty_like(img)
         for y in range(out.shape[0]):
-            ys = slice(y, y + 2*pad + 1)
+            ys = slice(y, y + 2 * pad + 1)
             for x in range(out.shape[1]):
-                xs = slice(x, x + 2*pad + 1)
+                xs = slice(x, x + 2 * pad + 1)
                 out[y, x] = float((im[ys, xs] * k).sum())
         return out
 
@@ -627,7 +732,7 @@ class PaletteVoronoiGenerator(BaseGenerator):
         flat /= (flat.sum() + 1e-8)
         idx = rng.choice(flat.size, size=n, replace=False if n <= flat.size else True, p=flat)
         y = (idx // W).astype(np.float32)
-        x = (idx %  W).astype(np.float32)
+        x = (idx % W).astype(np.float32)
         return np.stack([y, x], axis=1)
 
     @staticmethod
@@ -638,8 +743,8 @@ class PaletteVoronoiGenerator(BaseGenerator):
         x = np.repeat(np.arange(W)[None, :], H, axis=0).astype(np.float32)
         w = weight
         sum_w = np.bincount(labels.ravel().astype(np.int32), weights=w.ravel(), minlength=n).astype(np.float32) + 1e-8
-        sum_y = np.bincount(labels.ravel().astype(np.int32), weights=(y*w).ravel(), minlength=n).astype(np.float32)
-        sum_x = np.bincount(labels.ravel().astype(np.int32), weights=(x*w).ravel(), minlength=n).astype(np.float32)
+        sum_y = np.bincount(labels.ravel().astype(np.int32), weights=(y * w).ravel(), minlength=n).astype(np.float32)
+        sum_x = np.bincount(labels.ravel().astype(np.int32), weights=(x * w).ravel(), minlength=n).astype(np.float32)
         cy = sum_y / sum_w
         cx = sum_x / sum_w
         return cy, cx
@@ -649,7 +754,7 @@ class PaletteVoronoiGenerator(BaseGenerator):
         H, W = labels.shape
         m = np.zeros((H, W), dtype=bool)
         m[1:, :] |= (labels[1:, :] != labels[:-1, :])
-        m[:-1, :] |= (labels[:-1, :] != labels[1:,  :])
+        m[:-1, :] |= (labels[:-1, :] != labels[1:, :])
         m[:, 1:] |= (labels[:, 1:] != labels[:, :-1])
         m[:, :-1] |= (labels[:, :-1] != labels[:, 1:])
         return m
@@ -664,12 +769,14 @@ class PaletteVoronoiGenerator(BaseGenerator):
     @staticmethod
     def _cell_color_mean(src: np.ndarray, labels: np.ndarray, n_sites: int) -> np.ndarray:
         lab = labels.ravel().astype(np.int32)
-        r = src[..., 0].ravel(); g = src[..., 1].ravel(); b = src[..., 2].ravel()
+        r = src[..., 0].ravel();
+        g = src[..., 1].ravel();
+        b = src[..., 2].ravel()
         count = np.bincount(lab, minlength=n_sites).astype(np.float32) + 1e-8
         sum_r = np.bincount(lab, weights=r, minlength=n_sites).astype(np.float32)
         sum_g = np.bincount(lab, weights=g, minlength=n_sites).astype(np.float32)
         sum_b = np.bincount(lab, weights=b, minlength=n_sites).astype(np.float32)
-        means = np.stack([sum_r/count, sum_g/count, sum_b/count], axis=1)
+        means = np.stack([sum_r / count, sum_g / count, sum_b / count], axis=1)
         return np.clip(means[labels.astype(np.int32)], 0, 255)
 
     @staticmethod
@@ -689,9 +796,11 @@ class PaletteVoronoiGenerator(BaseGenerator):
 
     @staticmethod
     def _local_contrast_boost(field: np.ndarray, amount: float) -> np.ndarray:
-        k1 = 3; k2 = 9
+        k1 = 3;
+        k2 = 9
         f = field.astype(np.float32)
-        mx = f.max(); mn = f.min()
+        mx = f.max();
+        mn = f.min()
         s = (f - mn) / (mx - mn + 1e-8)
         b1 = _box_blur_gray(s, k=max(1, k1 | 1))
         b2 = _box_blur_gray(s, k=max(1, k2 | 1))
@@ -715,7 +824,7 @@ class PaletteVoronoiGenerator(BaseGenerator):
         out = np.empty_like(arr)
         for ch in range(3):
             p = arr[:, :, ch] / 255.0
-            mean_p  = _box_blur_gray(p, r)
+            mean_p = _box_blur_gray(p, r)
             mean_Ip = _box_blur_gray(I * p, r)
             cov_Ip = mean_Ip - mean_I * mean_p
             a = cov_Ip / (var_I + eps)
@@ -727,56 +836,79 @@ class PaletteVoronoiGenerator(BaseGenerator):
         alpha = 0.65 * amount
         return np.clip((1.0 - alpha) * arr + alpha * out, 0, 255)
 
+
 @dataclass
 class PaletteNovelGenerator(BaseGenerator):
     """
     Procedural, non-derivative image that borrows *global* cues from the photo
-    for realism: color ramp vs luminance, soft composition density, dominant
-    orientation, and optional horizon. Geometry is synthesized (no structure
-    from the photo is reused).
+    for realism.
     """
     seed: Optional[int] = None
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            # Pattern
+            {"name": "motif", "type": str, "default": "cells", "choices": ["cells", "waves", "stripes", "clouds"],
+             "help": "Base visual pattern."},
+            {"name": "sites", "type": int, "default": 1200, "min": 100, "max": 4000, "help": "Number of cells."},
+            {"name": "relax", "type": int, "default": 2, "min": 0, "max": 10, "help": "Lloyd relaxation steps."},
+            # Style
+            {"name": "smoothness", "type": float, "default": 0.20, "min": 0.0, "max": 1.0,
+             "help": "Post-process guided smoothing."},
+            {"name": "substance", "type": float, "default": 0.55, "min": 0.0, "max": 1.0,
+             "help": "Cell depth/3D effect."},
+            {"name": "edge_glow", "type": float, "default": 0.12, "min": 0.0, "max": 1.0,
+             "help": "Glow between cells."},
+            {"name": "coherence", "type": float, "default": 0.90, "min": 0.0, "max": 1.0, "help": "Color consistency."},
+            # Photo Cues
+            {"name": "photo_enable", "type": bool, "default": True, "help": "Use photo cues for layout."},
+            {"name": "photo_density", "type": float, "default": 0.55, "min": 0.0, "max": 1.0,
+             "help": "Density influence from photo."},
+            {"name": "photo_orient", "type": float, "default": 0.65, "min": 0.0, "max": 1.0,
+             "help": "Orientation influence from photo."}
+        ]
 
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         rng = _rng(self.seed)
 
         # ---------- user params ----------
-        out_w = int(kwargs.get("width",  input_image.width))
+        out_w = int(kwargs.get("width", input_image.width))
         out_h = int(kwargs.get("height", input_image.height))
 
         # content/style
-        motif      = str(kwargs.get("motif", "cells")).lower()   # cells|waves|stripes|clouds
-        sites      = max(128, int(kwargs.get("sites", 1200)))    # for 'cells'
-        shade      = float(kwargs.get("shade", 0.20))             # 0..1
-        smooth     = float(kwargs.get("smooth", 0.18))            # pre-smoothing of tonal field
-        smoothness = float(kwargs.get("smoothness", 0.20))        # guided smoothing post
-        clarity    = float(kwargs.get("clarity", 0.16))           # luminance-only unsharp
+        motif = str(kwargs.get("motif", "cells")).lower()  # cells|waves|stripes|clouds
+        sites = max(128, int(kwargs.get("sites", 1200)))  # for 'cells'
+        shade = float(kwargs.get("shade", 0.20))  # 0..1
+        smooth = float(kwargs.get("smooth", 0.18))  # pre-smoothing of tonal field
+        smoothness = float(kwargs.get("smoothness", 0.20))  # guided smoothing post
+        clarity = float(kwargs.get("clarity", 0.16))  # luminance-only unsharp
         saturation = float(kwargs.get("saturation", 1.02))
-        coherence  = float(kwargs.get("coherence", 0.90))         # 1.0 = perfectly coherent colors
-        relax      = max(0, int(kwargs.get("relax", 2)))          # Lloyd steps
-        seed_jit   = float(kwargs.get("seed_jitter", 0.18))
-        aa         = float(kwargs.get("aa", 1.35))
+        coherence = float(kwargs.get("coherence", 0.90))  # 1.0 = perfectly coherent colors
+        relax = max(0, int(kwargs.get("relax", 2)))  # Lloyd steps
+        seed_jit = float(kwargs.get("seed_jitter", 0.18))
+        aa = float(kwargs.get("aa", 1.35))
 
         # extra “substance” knobs
-        q_levels   = max(0, int(kwargs.get("q_levels", 7)))       # luminance quantization (0=off)
-        contrast   = float(kwargs.get("contrast", 0.18))          # local contrast in tonal field
-        substance  = float(kwargs.get("substance", 0.55))         # intra-cell form
-        edge_glow  = float(kwargs.get("edge_glow", 0.12))         # soft delineation
-        vignette   = float(kwargs.get("vignette", 0.08))
+        q_levels = max(0, int(kwargs.get("q_levels", 7)))  # luminance quantization (0=off)
+        contrast = float(kwargs.get("contrast", 0.18))  # local contrast in tonal field
+        substance = float(kwargs.get("substance", 0.55))  # intra-cell form
+        edge_glow = float(kwargs.get("edge_glow", 0.12))  # soft delineation
+        vignette = float(kwargs.get("vignette", 0.08))
 
         # palette / ref image
-        k_colors   = max(3, int(kwargs.get("colors", 9)))
-        ref        = kwargs.get("ref", None)
+        k_colors = max(3, int(kwargs.get("colors", 9)))
+        ref = kwargs.get("ref", None)
         src_for_palette = _open_image_any(ref) if ref else input_image
         palette = _extract_palette_kmeans(src_for_palette, k=k_colors, rng=rng, sample_px=60_000).astype(np.float32)
 
         # photo-real cues
-        photo_enable   = str(kwargs.get("photo_enable", "true")).lower() == "true"
-        photo_bins     = int(kwargs.get("photo_bins", 64))
-        photo_density  = float(kwargs.get("photo_density", 0.55))  # 0..1 weight for composition density
-        photo_orient   = float(kwargs.get("photo_orient", 0.65))   # 0..1 weight for orientation alignment
-        auto_horizon   = str(kwargs.get("auto_horizon", "true")).lower() == "true"
-        horizon        = kwargs.get("horizon", None)
+        photo_enable = str(kwargs.get("photo_enable", "true")).lower() == "true"
+        photo_bins = int(kwargs.get("photo_bins", 64))
+        photo_density = float(kwargs.get("photo_density", 0.55))  # 0..1 weight for composition density
+        photo_orient = float(kwargs.get("photo_orient", 0.65))  # 0..1 weight for orientation alignment
+        auto_horizon = str(kwargs.get("auto_horizon", "true")).lower() == "true"
+        horizon = kwargs.get("horizon", None)
 
         photo = _photo_elements(src_for_palette, bins=photo_bins) if photo_enable else None
         if auto_horizon and horizon is None and photo and photo["horizon"] is not None:
@@ -845,7 +977,8 @@ class PaletteNovelGenerator(BaseGenerator):
                 sites01[:, 0] = np.clip(cx / (W - 1 + 1e-8), 0, 1)
                 sites01[:, 1] = np.clip(cy / (H - 1 + 1e-8), 0, 1)
                 labels = PaletteVoronoiGenerator._voronoi_labels_streaming(
-                    H, W, sites01, edge_map, 0.0, row_chunk=256, want_second=False, precision="f16", labels_dtype=np.int32
+                    H, W, sites01, edge_map, 0.0, row_chunk=256, want_second=False, precision="f16",
+                    labels_dtype=np.int32
                 )
 
             # Global color coherence via mapped tonal; then per-cell mean
@@ -931,7 +1064,8 @@ class PaletteNovelGenerator(BaseGenerator):
 
         if abs(saturation - 1.0) > 1e-6:
             Y, U, V = PaletteVoronoiGenerator._rgb_to_yuv(rgb)
-            U *= saturation; V *= saturation
+            U *= saturation;
+            V *= saturation
             rgb = PaletteVoronoiGenerator._yuv_to_rgb(Y, U, V)
 
         if vignette > 0:
@@ -948,29 +1082,32 @@ class PaletteNovelGenerator(BaseGenerator):
     @staticmethod
     def _halton_sites(n: int) -> np.ndarray:
         def halton(i: int, b: int) -> float:
-            f = 1.0; r = 0.0
+            f = 1.0;
+            r = 0.0
             while i > 0:
                 f /= b
                 r += f * (i % b)
                 i //= b
             return r
+
         pts = np.empty((n, 2), np.float32)
         for i in range(n):
             pts[i, 0] = halton(i + 1, 2)
             pts[i, 1] = halton(i + 1, 3)
         return pts
 
+
 @dataclass
 class PaletteContextGenerator(BaseGenerator):
     """
-    Pure contextual generator:
-      - Geometry is fully procedural (no reuse of image structure).
-      - Borrows only global cues (color ramp vs luminance, dominant orientation,
-        soft composition density, and optional horizon).
-      - Ignores/overrides 'photo_enable' and 'ref' so output is always contextual-only.
-      - Accepts stylistic knobs via **kwargs, but keeps the above guarantees.
+    Pure contextual generator (geometry procedural, colors from profile).
     """
     seed: Optional[int] = None
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        # Identical parameters to Novel, but with restricted content toggles
+        return PaletteNovelGenerator.get_params()
 
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         rng = _rng(self.seed)
@@ -981,33 +1118,33 @@ class PaletteContextGenerator(BaseGenerator):
         kwargs.pop("ref", None)
 
         # ---------- user params (style only; safe defaults) ----------
-        out_w = int(kwargs.get("width",  input_image.width))
+        out_w = int(kwargs.get("width", input_image.width))
         out_h = int(kwargs.get("height", input_image.height))
 
-        motif      = str(kwargs.get("motif", "cells")).lower()   # cells|waves|stripes|clouds
-        sites      = max(128, int(kwargs.get("sites", 1200)))
-        shade      = float(kwargs.get("shade", 0.20))
-        smooth     = float(kwargs.get("smooth", 0.18))
+        motif = str(kwargs.get("motif", "cells")).lower()  # cells|waves|stripes|clouds
+        sites = max(128, int(kwargs.get("sites", 1200)))
+        shade = float(kwargs.get("shade", 0.20))
+        smooth = float(kwargs.get("smooth", 0.18))
         smoothness = float(kwargs.get("smoothness", 0.20))
-        clarity    = float(kwargs.get("clarity", 0.16))
+        clarity = float(kwargs.get("clarity", 0.16))
         saturation = float(kwargs.get("saturation", 1.02))
-        coherence  = float(kwargs.get("coherence", 0.90))
-        relax      = max(0, int(kwargs.get("relax", 2)))
-        seed_jit   = float(kwargs.get("seed_jitter", 0.18))
-        aa         = float(kwargs.get("aa", 1.35))
+        coherence = float(kwargs.get("coherence", 0.90))
+        relax = max(0, int(kwargs.get("relax", 2)))
+        seed_jit = float(kwargs.get("seed_jitter", 0.18))
+        aa = float(kwargs.get("aa", 1.35))
 
-        q_levels   = max(0, int(kwargs.get("q_levels", 7)))
-        contrast   = float(kwargs.get("contrast", 0.18))
-        substance  = float(kwargs.get("substance", 0.55))
-        edge_glow  = float(kwargs.get("edge_glow", 0.12))
-        vignette   = float(kwargs.get("vignette", 0.08))
+        q_levels = max(0, int(kwargs.get("q_levels", 7)))
+        contrast = float(kwargs.get("contrast", 0.18))
+        substance = float(kwargs.get("substance", 0.55))
+        edge_glow = float(kwargs.get("edge_glow", 0.12))
+        vignette = float(kwargs.get("vignette", 0.08))
 
         # weights for contextual cues
-        photo_bins     = int(kwargs.get("photo_bins", 64))
-        photo_density  = float(kwargs.get("photo_density", 0.55))  # density influence (0..1)
-        photo_orient   = float(kwargs.get("photo_orient", 0.65))   # orientation influence (0..1)
-        auto_horizon   = str(kwargs.get("auto_horizon", "true")).lower() == "true"
-        horizon        = kwargs.get("horizon", None)
+        photo_bins = int(kwargs.get("photo_bins", 64))
+        photo_density = float(kwargs.get("photo_density", 0.55))  # density influence (0..1)
+        photo_orient = float(kwargs.get("photo_orient", 0.65))  # orientation influence (0..1)
+        auto_horizon = str(kwargs.get("auto_horizon", "true")).lower() == "true"
+        horizon = kwargs.get("horizon", None)
 
         # ---------- extract global cues from the source image ----------
         # Only global descriptors: ramp/orientation/horizon/density
@@ -1079,7 +1216,8 @@ class PaletteContextGenerator(BaseGenerator):
                 sites01[:, 0] = np.clip(cx / (W - 1 + 1e-8), 0, 1)
                 sites01[:, 1] = np.clip(cy / (H - 1 + 1e-8), 0, 1)
                 labels = PaletteVoronoiGenerator._voronoi_labels_streaming(
-                    H, W, sites01, edge_map, 0.0, row_chunk=256, want_second=False, precision="f16", labels_dtype=np.int32
+                    H, W, sites01, edge_map, 0.0, row_chunk=256, want_second=False, precision="f16",
+                    labels_dtype=np.int32
                 )
 
             # Global color coherence via mapped tonal; then per-cell mean
@@ -1158,7 +1296,8 @@ class PaletteContextGenerator(BaseGenerator):
 
         if abs(saturation - 1.0) > 1e-6:
             Y, U, V = PaletteVoronoiGenerator._rgb_to_yuv(rgb)
-            U *= saturation; V *= saturation
+            U *= saturation;
+            V *= saturation
             rgb = PaletteVoronoiGenerator._yuv_to_rgb(Y, U, V)
 
         if shade > 0:
@@ -1181,78 +1320,123 @@ class PaletteContextGenerator(BaseGenerator):
     @staticmethod
     def _halton_sites(n: int) -> np.ndarray:
         def halton(i: int, b: int) -> float:
-            f = 1.0; r = 0.0
+            f = 1.0;
+            r = 0.0
             while i > 0:
                 f /= b
                 r += f * (i % b)
                 i //= b
             return r
+
         pts = np.empty((n, 2), np.float32)
         for i in range(n):
             pts[i, 0] = halton(i + 1, 2)
             pts[i, 1] = halton(i + 1, 3)
         return pts
+
+
 # ================== PhotoEnhance (no geometry; photo intact) ==================
 @dataclass
 class PhotoEnhanceGenerator(BaseGenerator):
     """
     High-definition, content-safe photo enhancer.
-    Strategy:
-      • SSAA upsample → enhance in high-res space → LANCZOS back down (perceived sharpness ↑).
-      • Noise-aware, edge-protected multi-band clarity (HF/MF/LF) + mild decon-like boost.
-      • Robust AWB, guarded dehaze, local contrast, vibrance w/ hue rolloff, tone shaping.
-      • Highlight/shadow protection, skin guard, gamut guard.
     """
     seed: Optional[int] = None
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return [
+            # Basics
+            {"name": "denoise", "type": float, "default": 0.12, "min": 0.0, "max": 1.0,
+             "help": "Noise reduction strength."},
+            {"name": "clarity", "type": float, "default": 0.40, "min": 0.0, "max": 1.0,
+             "help": "Mid-tone contrast and structure."},
+            {"name": "local_contrast", "type": float, "default": 0.30, "min": 0.0, "max": 1.0,
+             "help": "Adaptive contrast boost."},
+            {"name": "saturation", "type": float, "default": 1.05, "min": 0.0, "max": 2.0, "help": "Color intensity."},
+            # White Balance
+            {"name": "auto_wb", "type": bool, "default": True, "help": "Automatic white balance correction."},
+            {"name": "wb_mode", "type": str, "default": "bright", "choices": ["bright", "mean", "median"],
+             "help": "Strategy for WB."},
+            {"name": "wb_strength", "type": float, "default": 0.95, "min": 0.0, "max": 1.0, "help": "WB mix factor."},
+            # Dehaze
+            {"name": "dehaze", "type": float, "default": 0.10, "min": 0.0, "max": 1.0,
+             "help": "Remove atmospheric haze."},
+            # Tone
+            {"name": "tone", "type": str, "default": "soft", "choices": ["off", "soft", "filmic", "auto"],
+             "help": "Tone mapping curve."},
+            {"name": "tone_strength", "type": float, "default": 0.62, "min": 0.0, "max": 1.0,
+             "help": "Tone mapping mix."},
+            {"name": "shadow_lift", "type": float, "default": 0.08, "min": 0.0, "max": 1.0,
+             "help": "Brighten shadows."},
+            {"name": "highlight_recovery", "type": float, "default": 0.12, "min": 0.0, "max": 1.0,
+             "help": "Recover blown highlights."},
+            # Detail
+            {"name": "microcontrast", "type": float, "default": 0.22, "min": 0.0, "max": 1.0,
+             "help": "Fine detail enhancement."},
+            {"name": "structure_boost", "type": float, "default": 0.26, "min": 0.0, "max": 1.0,
+             "help": "Medium detail enhancement."},
+            {"name": "texture_boost", "type": float, "default": 0.20, "min": 0.0, "max": 1.0,
+             "help": "Coarse detail enhancement."},
+            # Color
+            {"name": "vibrance", "type": float, "default": 0.12, "min": 0.0, "max": 1.0,
+             "help": "Smart saturation for muted colors."},
+            {"name": "protect_skin", "type": float, "default": 0.15, "min": 0.0, "max": 1.0,
+             "help": "Prevent skin tone shifts."},
+            # Quality
+            {"name": "ssaa", "type": float, "default": 2.0, "min": 1.0, "max": 3.0, "help": "Super-sampling factor."},
+            {"name": "resample_factor", "type": float, "default": 1.0, "min": 0.1, "max": 4.0,
+             "help": "Final output scale."}
+        ]
 
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         # ---------- Potent defaults (still safe) ----------
         # SSAA (perceived “higher-res”): 1.6–3.0 recommended
-        ssaa              = float(kwargs.get("ssaa", 2.0))                 # 1.0..3.0
-        ssaa              = max(1.0, min(3.0, ssaa))
+        ssaa = float(kwargs.get("ssaa", 2.0))  # 1.0..3.0
+        ssaa = max(1.0, min(3.0, ssaa))
 
         # Base knobs
-        denoise           = float(kwargs.get("denoise", 0.12))
-        clarity           = float(kwargs.get("clarity", 0.40))              # stronger default
-        local_contrast    = float(kwargs.get("local_contrast", 0.30))
-        saturation        = float(kwargs.get("saturation", 1.05))
-        protect_high      = float(kwargs.get("protect_highlights", 0.14))
-        protect_shadow    = float(kwargs.get("protect_shadows", 0.08))
+        denoise = float(kwargs.get("denoise", 0.12))
+        clarity = float(kwargs.get("clarity", 0.40))  # stronger default
+        local_contrast = float(kwargs.get("local_contrast", 0.30))
+        saturation = float(kwargs.get("saturation", 1.05))
+        protect_high = float(kwargs.get("protect_highlights", 0.14))
+        protect_shadow = float(kwargs.get("protect_shadows", 0.08))
 
         # Potency & guards
-        auto_wb           = str(kwargs.get("auto_wb", "true")).lower() == "true"
-        wb_mode           = str(kwargs.get("wb_mode", "bright")).lower()    # bright favors neutral highlights
-        wb_strength       = float(kwargs.get("wb_strength", 0.95))
+        auto_wb = str(kwargs.get("auto_wb", "true")).lower() == "true"
+        wb_mode = str(kwargs.get("wb_mode", "bright")).lower()  # bright favors neutral highlights
+        wb_strength = float(kwargs.get("wb_strength", 0.95))
 
-        dehaze_amt        = float(kwargs.get("dehaze", 0.10))
-        dehaze_radius     = int(kwargs.get("dehaze_radius", 7))
-        dehaze_edge_refine= float(kwargs.get("dehaze_edge_refine", 0.40))
+        dehaze_amt = float(kwargs.get("dehaze", 0.10))
+        dehaze_radius = int(kwargs.get("dehaze_radius", 7))
+        dehaze_edge_refine = float(kwargs.get("dehaze_edge_refine", 0.40))
 
-        chroma_denoise    = float(kwargs.get("chroma_denoise", 0.12))
-        noise_floor       = float(kwargs.get("noise_floor", 0.14))
-        lc_mid_bias       = float(kwargs.get("lc_mid_bias", 0.58))
-        microcontrast     = float(kwargs.get("microcontrast", 0.22))
+        chroma_denoise = float(kwargs.get("chroma_denoise", 0.12))
+        noise_floor = float(kwargs.get("noise_floor", 0.14))
+        lc_mid_bias = float(kwargs.get("lc_mid_bias", 0.58))
+        microcontrast = float(kwargs.get("microcontrast", 0.22))
 
-        clarity_halo_guard= float(kwargs.get("clarity_halo_guard", 0.48))
-        sharpen_thresh    = float(kwargs.get("sharpen_threshold", 0.10))
-        structure_boost   = float(kwargs.get("structure_boost", 0.26))
-        texture_boost     = float(kwargs.get("texture_boost", 0.20))
+        clarity_halo_guard = float(kwargs.get("clarity_halo_guard", 0.48))
+        sharpen_thresh = float(kwargs.get("sharpen_threshold", 0.10))
+        structure_boost = float(kwargs.get("structure_boost", 0.26))
+        texture_boost = float(kwargs.get("texture_boost", 0.20))
 
-        tone              = str(kwargs.get("tone", "soft")).lower()         # off|soft|filmic|auto
-        tone_strength     = float(kwargs.get("tone_strength", 0.62))
-        shadow_lift       = float(kwargs.get("shadow_lift", 0.08))
-        highlight_rec     = float(kwargs.get("highlight_recovery", 0.12))
+        tone = str(kwargs.get("tone", "soft")).lower()  # off|soft|filmic|auto
+        tone_strength = float(kwargs.get("tone_strength", 0.62))
+        shadow_lift = float(kwargs.get("shadow_lift", 0.08))
+        highlight_rec = float(kwargs.get("highlight_recovery", 0.12))
 
-        vibrance          = float(kwargs.get("vibrance", 0.12))
+        vibrance = float(kwargs.get("vibrance", 0.12))
         vibrance_hue_roll = float(kwargs.get("vibrance_hue_roll", 0.35))
-        protect_skin      = float(kwargs.get("protect_skin", 0.15))
+        protect_skin = float(kwargs.get("protect_skin", 0.15))
 
-        gamut_guard       = float(kwargs.get("gamut_guard", 0.70))
-        chroma_guard      = float(kwargs.get("chroma_guard", 0.40))
+        gamut_guard = float(kwargs.get("gamut_guard", 0.70))
+        chroma_guard = float(kwargs.get("chroma_guard", 0.40))
 
         # Decon-like extra bite (small & safe)
-        decon_gain        = float(kwargs.get("decon_gain", 0.18))           # 0..0.35
-        decon_radius_px   = int(kwargs.get("decon_radius_px", 1))           # kernel ~3x3/5x5 effort
+        decon_gain = float(kwargs.get("decon_gain", 0.18))  # 0..0.35
+        decon_radius_px = int(kwargs.get("decon_radius_px", 1))  # kernel ~3x3/5x5 effort
 
         # --- new resample knobs (final stage) ---
         resample_spec = kwargs.get("resample", None)  # e.g. "2400x1600" or "1.5x"
@@ -1275,7 +1459,7 @@ class PhotoEnhanceGenerator(BaseGenerator):
         arr = np.asarray(img, dtype=np.float32)
 
         def _to_gray01(a: np.ndarray) -> np.ndarray:
-            return (0.299*a[...,0] + 0.587*a[...,1] + 0.114*a[...,2]) / 255.0
+            return (0.299 * a[..., 0] + 0.587 * a[..., 1] + 0.114 * a[..., 2]) / 255.0
 
         gray01 = _to_gray01(arr)
 
@@ -1284,33 +1468,34 @@ class PhotoEnhanceGenerator(BaseGenerator):
             eps = 1e-6
             if wb_mode == "bright":
                 mask = gray01 > np.percentile(gray01, 65.0)
-                means = np.maximum((arr[mask].reshape(-1,3).mean(0) if mask.any() else arr.reshape(-1,3).mean(0)), eps)
+                means = np.maximum((arr[mask].reshape(-1, 3).mean(0) if mask.any() else arr.reshape(-1, 3).mean(0)),
+                                   eps)
             elif wb_mode == "mean":
-                means = np.maximum(arr.reshape(-1,3).mean(0), eps)
+                means = np.maximum(arr.reshape(-1, 3).mean(0), eps)
             else:  # median
-                means = np.maximum(np.median(arr.reshape(-1,3), axis=0), eps)
+                means = np.maximum(np.median(arr.reshape(-1, 3), axis=0), eps)
             m = means.mean()
             gains = np.clip(m / means, 0.7, 1.35)
-            gains = (1.0 - wb_strength) * np.array([1,1,1], np.float32) + wb_strength * gains
+            gains = (1.0 - wb_strength) * np.array([1, 1, 1], np.float32) + wb_strength * gains
             arr = np.clip(arr * gains[None, None, :], 0, 255)
 
         # ---------- 0.5) Guarded Dehaze ----------
         if dehaze_amt > 1e-6:
             k = max(3, dehaze_radius | 1)
-            min3 = np.minimum.reduce([arr[:,:,0], arr[:,:,1], arr[:,:,2]])
+            min3 = np.minimum.reduce([arr[:, :, 0], arr[:, :, 1], arr[:, :, 2]])
             dark = _box_blur_gray(min3, k=k)
-            A = np.array([np.percentile(arr[:,:,c], 99.5) for c in range(3)], dtype=np.float32) + 1e-6
+            A = np.array([np.percentile(arr[:, :, c], 99.5) for c in range(3)], dtype=np.float32) + 1e-6
             t0 = np.clip(1.0 - 0.95 * (dark / (np.max(dark) + 1e-6)), 0.12, 1.0)
             if dehaze_edge_refine > 0:
                 t_b = _box_blur_gray(t0, k=5)
                 edge = PaletteVoronoiGenerator._edge_importance_from_gray(gray01.astype(np.float32))
                 edge = edge / (edge.max() + 1e-8)
-                t = np.clip((1.0 - dehaze_edge_refine*edge)*t0 + (dehaze_edge_refine*edge)*t_b, 0.12, 1.0)
+                t = np.clip((1.0 - dehaze_edge_refine * edge) * t0 + (dehaze_edge_refine * edge) * t_b, 0.12, 1.0)
             else:
                 t = t0
             t = (1.0 - dehaze_amt) + dehaze_amt * t
             for c in range(3):
-                arr[:,:,c] = np.clip((arr[:,:,c] - A[c]) / t + A[c], 0, 255)
+                arr[:, :, c] = np.clip((arr[:, :, c] - A[c]) / t + A[c], 0, 255)
 
         # ---------- 1) YUV split & chroma denoise ----------
         Y, U, V = PaletteVoronoiGenerator._rgb_to_yuv(arr)
@@ -1344,8 +1529,8 @@ class PhotoEnhanceGenerator(BaseGenerator):
         # ---------- 3.5) Multi-band clarity + decon-style bite ----------
         if (clarity > 0) or (structure_boost > 0) or (texture_boost > 0) or (microcontrast > 0) or (decon_gain > 0):
             # bands
-            Yb3  = _box_blur_gray(Y, k=3)
-            Yb7  = _box_blur_gray(Y, k=7)
+            Yb3 = _box_blur_gray(Y, k=3)
+            Yb7 = _box_blur_gray(Y, k=7)
             Yb13 = _box_blur_gray(Y, k=13)
             hf = Y - Yb3
             mf = Yb3 - Yb7
@@ -1362,18 +1547,18 @@ class PhotoEnhanceGenerator(BaseGenerator):
                 return np.where(np.abs(x) > thr, x, 0.0)
 
             hf = _th(hf, sharpen_thresh)
-            mf = _th(mf, 0.5*sharpen_thresh)
-            bf = _th(Y - Yb13, 0.25*sharpen_thresh)  # broader band
+            mf = _th(mf, 0.5 * sharpen_thresh)
+            bf = _th(Y - Yb13, 0.25 * sharpen_thresh)  # broader band
 
-            g_hf = texture_boost + 0.50*clarity + 0.70*microcontrast
-            g_mf = structure_boost + 0.35*clarity
-            g_lf = 0.20*clarity + 0.25*microcontrast
-            mix  = g_hf*hf + g_mf*mf + g_lf*bf
+            g_hf = texture_boost + 0.50 * clarity + 0.70 * microcontrast
+            g_mf = structure_boost + 0.35 * clarity
+            g_lf = 0.20 * clarity + 0.25 * microcontrast
+            mix = g_hf * hf + g_mf * mf + g_lf * bf
 
             # small decon-like impulse: difference of Gaussians with tighter k
             if decon_gain > 0:
-                k_small = max(1, int(2*decon_radius_px) | 1)        # 3..5
-                k_large = max(3, int(2*k_small+1) | 1)              # 5..9
+                k_small = max(1, int(2 * decon_radius_px) | 1)  # 3..5
+                k_large = max(3, int(2 * k_small + 1) | 1)  # 5..9
                 Ys = _box_blur_gray(Y, k=k_small)
                 Yl = _box_blur_gray(Y, k=k_large)
                 decon = Ys - Yl
@@ -1383,7 +1568,7 @@ class PhotoEnhanceGenerator(BaseGenerator):
                 mix = 255.0 * mix / (np.max(np.abs(mix)) + 1e-8)
 
             y01 = np.clip(Y / 255.0, 0, 1)
-            extreme_guard = (0.85 - 0.7*np.abs(y01-0.5))
+            extreme_guard = (0.85 - 0.7 * np.abs(y01 - 0.5))
             mix *= np.clip(extreme_guard, 0.25, 1.0)
             Y = np.clip(Y + edge_mask * mix, 0, 255)
 
@@ -1393,57 +1578,63 @@ class PhotoEnhanceGenerator(BaseGenerator):
             if tone == "soft":
                 mapped = y01 / (1.0 + y01)
             elif tone == "filmic":
-                A,B,C,D,E,F = 0.22, 0.30, 0.10, 0.20, 0.01, 0.30
-                def hable(x): return ((x*(A*x+C*B)+D*E)/(x*(A*x+B)+D*F)) - E/F
-                mapped = np.clip(hable(2.0*y01), 0, 1)
+                A, B, C, D, E, F = 0.22, 0.30, 0.10, 0.20, 0.01, 0.30
+
+                def hable(x):
+                    return ((x * (A * x + C * B) + D * E) / (x * (A * x + B) + D * F)) - E / F
+
+                mapped = np.clip(hable(2.0 * y01), 0, 1)
             elif tone == "auto":
                 mid = float(np.median(y01))
-                c = 0.6 + 0.8*(mid - 0.5)
-                mapped = 1/(1+np.exp(-6*c*(y01-0.5)))
+                c = 0.6 + 0.8 * (mid - 0.5)
+                mapped = 1 / (1 + np.exp(-6 * c * (y01 - 0.5)))
             else:
                 mapped = y01
             y_tone = (1.0 - tone_strength) * y01 + tone_strength * mapped
             if shadow_lift > 0:
-                y_tone = y_tone + shadow_lift * (1.0 - np.exp(-4.0*y_tone)) * (1.0 - y_tone)
+                y_tone = y_tone + shadow_lift * (1.0 - np.exp(-4.0 * y_tone)) * (1.0 - y_tone)
             if highlight_rec > 0:
-                y_tone = y_tone - highlight_rec * (1.0 - np.exp(-4.0*(1.0 - y_tone))) * (y_tone)
+                y_tone = y_tone - highlight_rec * (1.0 - np.exp(-4.0 * (1.0 - y_tone))) * (y_tone)
             Y = np.clip(255.0 * y_tone, 0, 255)
 
         # ---------- 5) Vibrance/saturation with hue rolloff + chroma guard ----------
         if abs(vibrance) > 1e-6 or abs(saturation - 1.0) > 1e-6:
             hue = np.arctan2(V, U)
-            red_mask = np.exp(-0.5*((hue/np.pi*3.0) - 0.0)**2)
-            sat_uv = np.sqrt(U**2 + V**2) + 1e-8
+            red_mask = np.exp(-0.5 * ((hue / np.pi * 3.0) - 0.0) ** 2)
+            sat_uv = np.sqrt(U ** 2 + V ** 2) + 1e-8
             vib_w = np.clip(1.0 - (sat_uv / (np.percentile(sat_uv, 95.0) + 1e-6)), 0.0, 1.0)
             vib_roll = 1.0 - vibrance_hue_roll * red_mask
             vib_scale = 1.0 + vibrance * vib_w * vib_roll
-            U *= vib_scale; V *= vib_scale
-            y01 = np.clip(Y/255.0, 0, 1.0)
-            extreme = np.clip(np.maximum(np.abs(y01-0.0), np.abs(y01-1.0)), 0.0, 1.0)
-            guard = 1.0 - chroma_guard * (0.6*extreme + 0.4*(1.0 - vib_w))
-            U *= guard; V *= guard
-            U *= saturation; V *= saturation
+            U *= vib_scale;
+            V *= vib_scale
+            y01 = np.clip(Y / 255.0, 0, 1.0)
+            extreme = np.clip(np.maximum(np.abs(y01 - 0.0), np.abs(y01 - 1.0)), 0.0, 1.0)
+            guard = 1.0 - chroma_guard * (0.6 * extreme + 0.4 * (1.0 - vib_w))
+            U *= guard;
+            V *= guard
+            U *= saturation;
+            V *= saturation
 
         # ---------- 6) Optional skin protection ----------
         if protect_skin > 0:
-            r,g,b = arr[...,0], arr[...,1], arr[...,2]
-            maxc = np.maximum.reduce([r,g,b]) + 1e-6
-            minc = np.minimum.reduce([r,g,b])
+            r, g, b = arr[..., 0], arr[..., 1], arr[..., 2]
+            maxc = np.maximum.reduce([r, g, b]) + 1e-6
+            minc = np.minimum.reduce([r, g, b])
             v = maxc / 255.0
             s = (maxc - minc) / maxc
             skin_hints = (r > g) & (g > b) & (s > 0.15) & (v > 0.20)
             if skin_hints.any():
-                Y = np.where(skin_hints, 0.90*Y + 0.10*_box_blur_gray(Y, k=5), Y)
+                Y = np.where(skin_hints, 0.90 * Y + 0.10 * _box_blur_gray(Y, k=5), Y)
 
         # ---------- 6.5) Highlight reconstruction ----------
         if highlight_rec > 1e-6:
-            clipped = (arr[:,:,0] > 250) | (arr[:,:,1] > 250) | (arr[:,:,2] > 250)
+            clipped = (arr[:, :, 0] > 250) | (arr[:, :, 1] > 250) | (arr[:, :, 2] > 250)
             if clipped.any():
                 Y_lin = np.clip(Y, 0, 255) + 1e-6
                 scale = (Y_lin / (np.maximum(arr.mean(axis=2), 1e-3)))
                 scale = np.clip(scale, 0.85, 1.10)
                 for c in range(3):
-                    arr[:,:,c] = np.where(clipped, np.clip(arr[:,:,c]*scale, 0, 255), arr[:,:,c])
+                    arr[:, :, c] = np.where(clipped, np.clip(arr[:, :, c] * scale, 0, 255), arr[:, :, c])
 
         # ---------- 7) Recompose & gamut guard ----------
         arr = PaletteVoronoiGenerator._yuv_to_rgb(Y, U, V)
@@ -1452,8 +1643,9 @@ class PhotoEnhanceGenerator(BaseGenerator):
             under = np.maximum(0.0 - arr, 0.0).max()
             if over > 1e-6 or under > 1e-6:
                 Yc, Uc, Vc = PaletteVoronoiGenerator._rgb_to_yuv(np.clip(arr, 0, 255))
-                scale = 1.0 - gamut_guard * np.clip((over+under)/64.0, 0.0, 1.0)
-                Uc *= scale; Vc *= scale
+                scale = 1.0 - gamut_guard * np.clip((over + under) / 64.0, 0.0, 1.0)
+                Uc *= scale;
+                Vc *= scale
                 arr = PaletteVoronoiGenerator._yuv_to_rgb(Yc, Uc, Vc)
 
         out_hi = Image.fromarray(np.clip(arr, 0, 255).astype(np.uint8), "RGB")
@@ -1545,15 +1737,23 @@ class PhotoEnhanceGenerator(BaseGenerator):
             Y = np.clip(Y + strength * 255.0 * hi / denom, 0, 255)
         return PaletteVoronoiGenerator._yuv_to_rgb(Y, U, V)
 
+
 @dataclass
 class PreviewGenerator(BaseGenerator):
     """
     Pure pass-through: preserves pixels 1:1 and (optionally) draws a tiny HUD.
     Useful as the first stage so you know you're previewing the capture as-is.
     """
+
     def generate(self, input_image: Image.Image, **kwargs) -> Image.Image:
         # No resampling; just return the frame
+        input_image.show()
         return input_image.convert("RGB")
+
+    @staticmethod
+    def get_params() -> List[Dict[str, Any]]:
+        return []
+
 
 # ---- Register defaults at import time ----
 REGISTRY.register("preview", PreviewGenerator)
