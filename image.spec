@@ -8,7 +8,7 @@ block_cipher = None
 
 # --- CONFIGURATION ---
 ENTRY_POINT = 'gui.py'
-APP_NAME = 'ImageGenGUI'
+APP_NAME = 'NatesImageGenGUI'
 FFMPEG_DIR = 'ffmpeg-8.0-essentials_build'
 # ---------------------
 

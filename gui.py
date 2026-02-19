@@ -573,7 +573,7 @@ class StageSettingsWidget(QWidget):
 class ImageGenGUI(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("Procedural Image Pipeline")
+        self.setWindowTitle("Nate's Procedural Image Pipeline")
         self.resize(1600, 900)
 
         self.original_image: Optional[Image.Image] = None
